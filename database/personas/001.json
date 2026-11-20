@@ -1,4 +1,9 @@
 {
-    "id": "001",
-    "name": "Hugh Jackman"
+    "name": "Hugh Jackman",
+    "user_id": "001",
+    "preferences": {
+        "music": "track2.mp3",
+        "brightness": 80,
+        "temperature": 22
+    }
 }

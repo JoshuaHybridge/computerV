@@ -1,4 +1,9 @@
 {
-    "id": "002",
-    "name": "Nidia"
+    "name": "Niño",
+    "user_id": "002",
+    "preferences": {
+        "music": "track1.mp3",
+        "brightness": 100,
+        "temperature": 24
+    }
 }

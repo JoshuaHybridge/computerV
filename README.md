@@ -41,10 +41,17 @@ http://127.0.0.1:8000/api/users
 
 El registro de usuarios se realizará con el método Post de POSTMAN o yendo al 
 directorio database/personas y modificar/crear de acuerdo a la estructura:
+
 {
-    "name": "Joshua",
-    "user_id": "001"
+    "name": "Hugh Jackman",
+    "user_id": "001",
+    "preferences": {
+        "music": "track2.mp3",
+        "brightness": 80,
+        "temperature": 22
+    }
 }
+
 
 El nombre del archivo será user_id.json
 
@@ -83,6 +90,9 @@ Si el programa reconoce al usuario entonces tendremos una salida de:
         "message": "Coincidencia facial."
     }
 } 
+
+# La música se reproducirá
+
 Si el formato de BASE64 no es valido:
 {
     "detail": "La imagen enviada no es válida."

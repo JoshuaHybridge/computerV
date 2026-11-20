@@ -1,3 +1,4 @@
+
 import os
 import base64
 import tempfile
@@ -8,6 +9,11 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# =====================================================
+# IMPORTACIONES DEL PROYECTO
+# =====================================================
+
+from src.SmartHome import activate_smart_home
 from src.recognizer import analyze_emotion
 from src.face_registration import register_face, verify_face
 from src.user import register_user, get_all_users, get_user
@@ -30,7 +36,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI(
     title="MoodMeter",
-    description="Sistema de análisis emocional y reconocimiento facial mediante DeepFace",
+    description="Sistema de análisis emocional, reconocimiento facial y automatización de hogares inteligentes mediante DeepFace",
     version="1.0.0"
 )
 
@@ -76,20 +82,40 @@ def decode_image(image_data):
 
     try:
 
+        print("\n========== DEBUG IMAGEN ==========")
+
+        print("Tipo recibido:", type(image_data))
+        print("Longitud recibida:", len(image_data))
+
+        if not image_data:
+            raise ValueError("Imagen vacía.")
+
+        # Eliminar encabezado Data URI si existe
         if "," in image_data:
             image_data = image_data.split(",", 1)[1]
+
+        image_data = image_data.strip()
+
+        print("Longitud Base64:", len(image_data))
+        print("Primeros caracteres:", repr(image_data[:50]))
 
         decoded_image = base64.b64decode(
             image_data,
             validate=True
         )
 
+        print("Bytes decodificados:", len(decoded_image))
+
+        print("==================================\n")
+
         if not decoded_image:
             raise ValueError("Imagen vacía.")
 
         return decoded_image
 
-    except Exception:
+    except Exception as error:
+
+        print("\nERROR AL DECODIFICAR:", repr(error))
 
         raise HTTPException(
             status_code=400,
@@ -299,12 +325,15 @@ async def create_face(
         message = str(error)
 
         if "ya tiene un rostro" in message:
+
             status_code = 409
 
         elif "no está registrado" in message:
+
             status_code = 404
 
         else:
+
             status_code = 422
 
         raise HTTPException(
@@ -314,7 +343,7 @@ async def create_face(
 
 
 # =====================================================
-# VERIFICAR IDENTIDAD FACIAL
+# VERIFICAR IDENTIDAD FACIAL + SMART HOME
 # =====================================================
 
 @app.post("/api/verify-face/{user_id}")
@@ -329,15 +358,68 @@ async def check_face(
 
     try:
 
+        # =============================================
+        # PASO 1: VERIFICACIÓN FACIAL
+        # =============================================
+
+        print("\n====================================")
+        print("       INICIANDO VERIFICACIÓN")
+        print("====================================")
+
         result = verify_face(
             user_id,
             image_bytes
         )
 
+        automation = None
+
+        # =============================================
+        # PASO 2: ACTIVAR SMART HOME
+        # =============================================
+
+        if result["verified"]:
+
+            print("\n====================================")
+            print("       IDENTIDAD VERIFICADA")
+            print("====================================")
+
+            print("Nombre:", result["name"])
+            print("ID:", user_id)
+
+            print("\nActivando Smart Home...")
+
+            try:
+
+                automation = activate_smart_home(
+                    user_id
+                )
+
+            except Exception as error:
+
+                print("ERROR SMART HOME:", str(error))
+
+                automation = {
+                    "success": False,
+                    "message": "La identidad fue verificada, pero ocurrió un error en Smart Home."
+                }
+
+        else:
+
+            print("\n====================================")
+            print("       IDENTIDAD NO VERIFICADA")
+            print("====================================")
+
+            print("Automatización desactivada.")
+
+        # =============================================
+        # PASO 3: RESPUESTA FINAL
+        # =============================================
+
         return {
             "success": True,
             "message": "Verificación facial procesada.",
-            "verification": result
+            "verification": result,
+            "smart_home": automation
         }
 
     except ValueError as error:
@@ -359,48 +441,7 @@ async def check_face(
             status_code=status_code,
             detail=message
         )
-def decode_image(image_data):
 
-    try:
-
-        print("\n========== DEBUG IMAGEN ==========")
-
-        print("Tipo recibido:", type(image_data))
-        print("Longitud recibida:", len(image_data))
-
-        if not image_data:
-            raise ValueError("Imagen vacía.")
-
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1]
-
-        image_data = image_data.strip()
-
-        print("Longitud Base64:", len(image_data))
-        print("Primeros caracteres:", repr(image_data[:50]))
-
-        decoded_image = base64.b64decode(
-            image_data,
-            validate=True
-        )
-
-        print("Bytes decodificados:", len(decoded_image))
-
-        print("==================================\n")
-
-        if not decoded_image:
-            raise ValueError("Imagen vacía.")
-
-        return decoded_image
-
-    except Exception as error:
-
-        print("\nERROR AL DECODIFICAR:", repr(error))
-
-        raise HTTPException(
-            status_code=400,
-            detail="La imagen enviada no es válida."
-        )
 
 # =====================================================
 # FIN DE LA API
