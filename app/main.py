@@ -1,146 +1,407 @@
 import os
 import base64
-import time
+import tempfile
+import re
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Intentar importar DeepFace para resiliencia durante la fase de instalación
-try:
-    from deepface import DeepFace
-except ImportError:
-    DeepFace = None
+from src.recognizer import analyze_emotion
+from src.face_registration import register_face, verify_face
+from src.user import register_user, get_all_users, get_user
+
+
+# =====================================================
+# CONFIGURACIÓN DE RUTAS
+# =====================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(BASE_DIR)
+
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+
+# =====================================================
+# INICIALIZACIÓN DE FASTAPI
+# =====================================================
 
 app = FastAPI(
-    title="MoodMeter API - Diagnóstico e Historial de Expresión Facial",
-    description="Backend ligero para analizar emociones faciales en tiempo real usando DeepFace y Keras."
+    title="MoodMeter",
+    description="Sistema de análisis emocional y reconocimiento facial mediante DeepFace",
+    version="1.0.0"
 )
 
-# Habilitar CORS para permitir integraciones locales ágiles y file://
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+
+# =====================================================
+# ARCHIVOS ESTÁTICOS
+# =====================================================
+
+app.mount(
+    "/static",
+    StaticFiles(directory=STATIC_DIR),
+    name="static"
 )
 
-# Definir carpetas clave de plantillas y archivos estáticos
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
-# Servir archivos estáticos si la carpeta existe
-if os.path.exists(TEMPLATES_DIR):
-    app.mount("/static", StaticFiles(directory=TEMPLATES_DIR), name="static")
+# =====================================================
+# MODELOS DE DATOS
+# =====================================================
 
-# Modelo de datos Pydantic para recibir capturas en base64
 class MoodAnalysisRequest(BaseModel):
-    image: str  # String en formato DataURL o Base64 simple
+    image: str
 
-def save_base64_image(base64_str: str, file_path: str):
-    """Decodifica un string base64 (removiendo encabezados DataURL) y lo guarda en disco."""
+
+class FaceRequest(BaseModel):
+    image: str
+
+
+class UserRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+
+    user_id: str = Field(
+        min_length=1,
+        max_length=30,
+        pattern=r"^[a-zA-Z0-9_-]+$"
+    )
+
+
+# =====================================================
+# FUNCIONES AUXILIARES
+# =====================================================
+
+def decode_image(image_data):
+
     try:
-        if "," in base64_str:
-            base64_str = base64_str.split(",")[1]
-        img_data = base64.b64decode(base64_str)
-        with open(file_path, "wb") as f:
-            f.write(img_data)
-        return True
-    except Exception as e:
-        print(f"Error al decodificar imagen Base64: {e}")
-        return False
+
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+
+        decoded_image = base64.b64decode(
+            image_data,
+            validate=True
+        )
+
+        if not decoded_image:
+            raise ValueError("Imagen vacía.")
+
+        return decoded_image
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=400,
+            detail="La imagen enviada no es válida."
+        )
+
+
+def validate_user_id(user_id):
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9_-]{1,30}",
+        user_id
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="ID de usuario inválido."
+        )
+
+
+def save_temp_image(image_bytes, suffix=".jpg"):
+
+    with tempfile.NamedTemporaryFile(
+        suffix=suffix,
+        delete=False
+    ) as temp_file:
+
+        temp_file.write(image_bytes)
+
+        return temp_file.name
+
+
+# =====================================================
+# PÁGINA PRINCIPAL
+# =====================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-    """Sirve la interfaz web del MoodMeter."""
-    index_path = os.path.join(TEMPLATES_DIR, "index.html")
-    if os.path.exists(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read(), status_code=200)
-    return HTMLResponse(
-        content="<h1>MoodMeter Frontend no encontrado</h1><p>Asegúrate de que la carpeta templates/index.html exista.</p>",
-        status_code=404
+async def home():
+
+    index_path = os.path.join(
+        TEMPLATES_DIR,
+        "index.html"
     )
+
+    if not os.path.isfile(index_path):
+
+        raise HTTPException(
+            status_code=500,
+            detail="No se encontró index.html."
+        )
+
+    with open(
+        index_path,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        return file.read()
+
+
+# =====================================================
+# ESTADO DEL SERVIDOR
+# =====================================================
+
+@app.get("/api/health")
+async def health():
+
+    return {
+        "status": "online",
+        "project": "MoodMeter"
+    }
+
+
+# =====================================================
+# ANÁLISIS EMOCIONAL
+# =====================================================
 
 @app.post("/api/analyze-mood")
 async def analyze_mood(payload: MoodAnalysisRequest):
-    """
-    Analiza una imagen facial y devuelve las emociones de forma porcentual,
-    el recuadro de la cara y el tiempo de inferencia de la red neuronal.
-    """
-    if not DeepFace:
-        raise HTTPException(
-            status_code=503,
-            detail="La librería DeepFace se está cargando o no se encuentra instalada en el sistema."
-        )
 
-    # Crear directorio temporal para procesar la imagen actual
-    temp_dir = os.path.join(BASE_DIR, "..", "data", "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    temp_filename = f"mood_{int(time.time() * 1000)}.jpg"
-    temp_path = os.path.join(temp_dir, temp_filename)
+    image_bytes = decode_image(payload.image)
 
-    # Guardar imagen en disco de forma temporal
-    if not save_base64_image(payload.image, temp_path):
-        raise HTTPException(status_code=400, detail="La imagen provista no tiene un formato Base64 decodificable válido.")
+    temp_path = None
 
-    start_time = time.time()
     try:
-        # Analizar emociones usando DeepFace con el backend de OpenCV para máxima ligereza
-        # actions=['emotion'] indica a la CNN calcular únicamente expresiones, acelerando el cómputo
-        analysis = DeepFace.analyze(
-            img_path=temp_path,
-            actions=['emotion'],
-            enforce_detection=True,  # Lanza excepción si no encuentra rostro detectable
-            detector_backend="opencv"
+
+        temp_path = save_temp_image(image_bytes)
+
+        result = analyze_emotion(temp_path)
+
+        return result
+
+    except ValueError as error:
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(error)
         )
 
-        inference_time = round(time.time() - start_time, 3)
+    except Exception as error:
 
-        # Si el análisis retorna una lista (caso típico en versiones modernas de DeepFace)
-        if isinstance(analysis, list):
-            result = analysis[0]
-        else:
-            result = analysis
-
-        # Extraer variables principales
-        emotions_raw = result["emotion"]  # Diccionario con 7 emociones
-        dominant_emotion = result["dominant_emotion"]
-        region = result["region"]  # Caja facial: {x, y, w, h}
-
-        # Asegurar remoción del archivo temporal
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        # Devolver respuesta estructurada
-        return {
-            "success": True,
-            "dominant_emotion": dominant_emotion,
-            "emotions": {k: float(round(v, 2)) for k, v in emotions_raw.items()},
-            "box": {
-                "x": int(region.get("x", 0)),
-                "y": int(region.get("y", 0)),
-                "w": int(region.get("w", 0)),
-                "h": int(region.get("h", 0))
-            },
-            "inference_time_seconds": float(inference_time)
-        }
-
-    except Exception as e:
-        # Limpiar archivo temporal
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        err_msg = str(e)
-        if "Face could not be detected" in err_msg:
-            raise HTTPException(
-                status_code=422,
-                detail="No se detectó ningún rostro en la imagen. Intenta con una mejor iluminación y colócate de frente."
-            )
         raise HTTPException(
             status_code=500,
-            detail=f"Error en el procesamiento neuronal de la imagen: {err_msg}"
+            detail=f"Error al analizar la imagen: {error}"
         )
+
+    finally:
+
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# =====================================================
+# REGISTRO DE USUARIOS
+# =====================================================
+
+@app.post("/api/users")
+async def create_user(payload: UserRequest):
+
+    try:
+
+        user = register_user(
+            payload.name.strip(),
+            payload.user_id.strip()
+        )
+
+        return {
+            "success": True,
+            "message": "Usuario registrado correctamente.",
+            "user": user
+        }
+
+    except ValueError as error:
+
+        raise HTTPException(
+            status_code=409,
+            detail=str(error)
+        )
+
+
+# =====================================================
+# CONSULTAR TODOS LOS USUARIOS
+# =====================================================
+
+@app.get("/api/users")
+async def list_users():
+
+    return {
+        "success": True,
+        "users": get_all_users()
+    }
+
+
+# =====================================================
+# CONSULTAR UN USUARIO POR ID
+# =====================================================
+
+@app.get("/api/users/{user_id}")
+async def find_user(user_id: str):
+
+    validate_user_id(user_id)
+
+    user = get_user(user_id)
+
+    if user is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Usuario no encontrado."
+        )
+
+    return {
+        "success": True,
+        "user": user
+    }
+
+
+# =====================================================
+# REGISTRAR ROSTRO DE UN USUARIO
+# =====================================================
+
+@app.post("/api/users/{user_id}/face")
+async def create_face(
+    user_id: str,
+    payload: FaceRequest
+):
+
+    validate_user_id(user_id)
+
+    image_bytes = decode_image(payload.image)
+
+    try:
+
+        result = register_face(
+            user_id,
+            image_bytes
+        )
+
+        return {
+            "success": True,
+            "message": "Rostro registrado correctamente.",
+            "result": result
+        }
+
+    except ValueError as error:
+
+        message = str(error)
+
+        if "ya tiene un rostro" in message:
+            status_code = 409
+
+        elif "no está registrado" in message:
+            status_code = 404
+
+        else:
+            status_code = 422
+
+        raise HTTPException(
+            status_code=status_code,
+            detail=message
+        )
+
+
+# =====================================================
+# VERIFICAR IDENTIDAD FACIAL
+# =====================================================
+
+@app.post("/api/verify-face/{user_id}")
+async def check_face(
+    user_id: str,
+    payload: FaceRequest
+):
+
+    validate_user_id(user_id)
+
+    image_bytes = decode_image(payload.image)
+
+    try:
+
+        result = verify_face(
+            user_id,
+            image_bytes
+        )
+
+        return {
+            "success": True,
+            "message": "Verificación facial procesada.",
+            "verification": result
+        }
+
+    except ValueError as error:
+
+        message = str(error)
+
+        if (
+            "no está registrado" in message
+            or "no tiene un rostro" in message
+        ):
+
+            status_code = 404
+
+        else:
+
+            status_code = 422
+
+        raise HTTPException(
+            status_code=status_code,
+            detail=message
+        )
+def decode_image(image_data):
+
+    try:
+
+        print("\n========== DEBUG IMAGEN ==========")
+
+        print("Tipo recibido:", type(image_data))
+        print("Longitud recibida:", len(image_data))
+
+        if not image_data:
+            raise ValueError("Imagen vacía.")
+
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+
+        image_data = image_data.strip()
+
+        print("Longitud Base64:", len(image_data))
+        print("Primeros caracteres:", repr(image_data[:50]))
+
+        decoded_image = base64.b64decode(
+            image_data,
+            validate=True
+        )
+
+        print("Bytes decodificados:", len(decoded_image))
+
+        print("==================================\n")
+
+        if not decoded_image:
+            raise ValueError("Imagen vacía.")
+
+        return decoded_image
+
+    except Exception as error:
+
+        print("\nERROR AL DECODIFICAR:", repr(error))
+
+        raise HTTPException(
+            status_code=400,
+            detail="La imagen enviada no es válida."
+        )
+
+# =====================================================
+# FIN DE LA API
+# =====================================================
